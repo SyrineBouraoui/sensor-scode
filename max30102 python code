@@ -1,1 +1,204 @@
+import smbus2
+import time
+from datetime import datetime
+import numpy as np
+import requests
+
+I2C_BUS = 2
+MAX30102_ADDR = 0x57
+
+# Register addresses for MAX30102
+REG_INTR_STATUS_1 = 0x00
+REG_INTR_ENABLE_1 = 0x02
+REG_FIFO_WR_PTR = 0x04
+REG_OVF_COUNTER = 0x05
+REG_FIFO_RD_PTR = 0x06
+REG_FIFO_DATA = 0x07
+REG_MODE_CONFIG = 0x09
+REG_SPO2_CONFIG = 0x0A
+REG_LED1_PA = 0x0C
+REG_LED2_PA = 0x0D
+
+
+API_URL = "http://:8080/api/heartrate/data"
+# Initialize I2C bus
+bus = smbus2.SMBus(I2C_BUS)
+
+def max30102_init():
+    print("Initializing MAX30102...")
+    try:
+        # Reset the sensor
+        bus.write_byte_data(MAX30102_ADDR, REG_MODE_CONFIG, 0x40)
+        time.sleep(0.1)
+        print("Reset sent")
+
+        # Mode configuration: SpO2 mode (Red + IR)
+        bus.write_byte_data(MAX30102_ADDR, REG_MODE_CONFIG, 0x03)
+        print("SpO2 mode set")
+
+        # SpO2 configuration: 50 samples/sec, 1600us pulse width, 4-sample avg
+        bus.write_byte_data(MAX30102_ADDR, REG_SPO2_CONFIG, 0x2B)
+        print("SpO2 config set")
+
+        # LED pulse amplitude (reduced to avoid saturation)
+        bus.write_byte_data(MAX30102_ADDR, REG_LED1_PA, 0x1F)  # Lower power
+        bus.write_byte_data(MAX30102_ADDR, REG_LED2_PA, 0x1F)  # Lower power
+        print("LED amplitudes set to medium")
+
+        # Enable data ready interrupt
+        bus.write_byte_data(MAX30102_ADDR, REG_INTR_ENABLE_1, 0xC0)
+        print("Interrupt enabled")
+    except Exception as e:
+        print(f"Initialization error: {e}")
+
+def max30102_read_fifo():
+    try:
+        # Read interrupt status to clear it
+        bus.read_byte_data(MAX30102_ADDR, REG_INTR_STATUS_1)
+        
+        fifo_wr_ptr = bus.read_byte_data(MAX30102_ADDR, REG_FIFO_WR_PTR)
+        fifo_rd_ptr = bus.read_byte_data(MAX30102_ADDR, REG_FIFO_RD_PTR)
+        num_samples = (fifo_wr_ptr - fifo_rd_ptr) & 0x1F
+
+        # Only print "no data" every 2 seconds
+        global last_no_data_print
+        current_time = time.time()
+        if num_samples == 0:
+            if current_time - last_no_data_print >= 2:
+                print(f"FIFO samples: {num_samples}")
+                print("No data in FIFO, check finger placement or signal strength")
+                last_no_data_print = current_time
+            return None, None
+
+        # Read one sample at a time to avoid exceeding 32-byte limit
+        red_samples = []
+        ir_samples = []
+        for _ in range(num_samples):
+            data = bus.read_i2c_block_data(MAX30102_ADDR, REG_FIFO_DATA, 6)
+            # Correctly parse 18-bit values
+            red = ((data[0] & 0x03) << 16) | (data[1] << 8) | data[2]
+            ir = ((data[3] & 0x03) << 16) | (data[4] << 8) | data[5]
+            red_samples.append(red)
+            ir_samples.append(ir)
+
+        # Use the latest sample
+        red = red_samples[-1]
+        ir = ir_samples[-1]
+
+        # Check signal strength
+        if ir < 20000 or ir > 200000:  # Adjusted threshold for valid signal
+            print("Invalid IR signal (too low or too high), adjust finger placement")
+            return None, None
+
+        return red, ir
+    except Exception as e:
+        print(f"FIFO read error: {e}")
+        return None, None
+
+def calculate_heart_rate(ir_data, sample_rate=50):
+    if len(ir_data) < 100:  # Require more samples for stability
+        return None
+    
+    # Basic filtering: Moving average to reduce noise
+    ir_data = np.array(ir_data, dtype=float)
+    window_size = 5
+    ir_data = np.convolve(ir_data, np.ones(window_size)/window_size, mode='valid')
+    
+    # Normalize data
+    ir_data -= np.mean(ir_data)
+    if np.max(ir_data) == 0:
+        return None
+    
+    # Peak detection
+    threshold = np.max(ir_data) * 0.4  # Adjusted threshold
+    peaks = []
+    for i in range(1, len(ir_data) - 1):
+        if ir_data[i] > threshold and ir_data[i] > ir_data[i-1] and ir_data[i] > ir_data[i+1]:
+            peaks.append(i)
+    
+    if len(peaks) < 2:
+        return None
+    
+    # Calculate intervals and validate
+    intervals = np.diff(peaks) / sample_rate
+    avg_interval = np.mean(intervals)
+    heart_rate = 60 / avg_interval
+    
+    # Validate heart rate (30-200 BPM range)
+    if 30 <= heart_rate <= 200:
+        return int(heart_rate)
+    return None
+
+def calculate_spo2(red, ir, red_buffer, ir_buffer):
+    if len(red_buffer) < 50 or len(ir_buffer) < 50:
+        return None
+    
+    red_avg = np.mean(red_buffer)
+    ir_avg = np.mean(ir_buffer)
+    red_ac = np.std(red_buffer)
+    ir_ac = np.std(ir_buffer)
+    
+    if red_avg == 0 or ir_avg == 0 or red_ac == 0 or ir_ac == 0:
+        return None
+    
+    # Calculate ratio (simplified from Arduino)
+    ratio = (red_ac * ir_avg) / (ir_ac * red_avg)
+    spo2 = -45.060 * ratio * ratio + 30.354 * ratio + 94.845
+    return int(spo2) if 50 <= spo2 <= 100 else None
+
+print("Reading MAX30102 on I2C-2...")
+try:
+    max30102_init()
+    ir_buffer = []
+    red_buffer = []
+    last_no_data_print = 0
+    last_print = 0
+    print_interval = 10 # Print every 3 seconds
+    
+    while True:
+        red, ir = max30102_read_fifo()
+        
+        # Process valid data
+        if red is not None and ir is not None:
+            ir_buffer.append(ir)
+            red_buffer.append(red)
+            if len(ir_buffer) > 200:
+                ir_buffer.pop(0)
+                red_buffer.pop(0)
+            
+            heart_rate = calculate_heart_rate(ir_buffer)
+            spo2 = calculate_spo2(red, ir, red_buffer, ir_buffer)
+            
+            # Print only at specified interval
+            if time.time() - last_print >= print_interval:
+                spo2_str = f"{spo2}" if spo2 is not None else "N/A"
+                print(f"Red: {red}, IR: {ir}, HR: {heart_rate if heart_rate else 'N/A'} BPM, SpO2: {spo2_str}%")
+                
+                # Send data to API only if both heart_rate and spo2 are valid
+                if heart_rate is not None and spo2 is not None:
+                    data = {
+                        "heartRate": heart_rate,
+                        "spo2": spo2,
+                        "timestamp": datetime.now().isoformat(),
+                        "patientId": "15"  # Include the patient ID
+                    }
+                    try:
+                        response = requests.post(API_URL, json=data)
+                        if response.status_code == 200 or response.status_code == 201:
+                            print(f"Data sent successfully: {data}")
+                        else:
+                            print(f"Failed to send data: {response.status_code} - {response.text}")
+                    except requests.exceptions.RequestException as e:
+                        print(f"API request error: {e}")
+                
+                last_print = time.time()
+        
+        time.sleep(0.02)  # Maintain 50 Hz sampling for data collection
+        
+except KeyboardInterrupt:
+    print("\nExiting program.")
+except Exception as e:
+    print(f"Error: {e}")
+finally:
+    bus.close()
 
