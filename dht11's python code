@@ -1,1 +1,109 @@
-f
+import wiringpi
+from wiringpi import GPIO
+import time
+import requests
+from datetime import datetime
+
+if wiringpi.wiringPiSetup() == -1:
+    print("WiringPi setup failed!")
+    exit(1)
+
+#For WiringPi pin 2 is physical pin 7 
+dht_pin = 2  
+
+wiringpi.pinMode(dht_pin, GPIO.OUTPUT)
+
+API_URL = "http://:8080/api/sensor/data"  
+
+def read_dht11():
+    # Switch to OUTPUT to send start signal
+    wiringpi.pinMode(dht_pin, GPIO.OUTPUT)
+
+    wiringpi.digitalWrite(dht_pin, GPIO.LOW)
+    wiringpi.delay(18)  # 18ms LOW
+    wiringpi.digitalWrite(dht_pin, GPIO.HIGH)
+    wiringpi.delayMicroseconds(40)
+
+    # Switch to INPUT to read response
+    wiringpi.pinMode(dht_pin, GPIO.INPUT)
+
+    timeout = 10000
+    count = 0
+    while wiringpi.digitalRead(dht_pin) == GPIO.HIGH:
+        count += 1
+        if count > timeout:
+            return None, None  # Timeout waiting for response
+
+    count = 0
+    while wiringpi.digitalRead(dht_pin) == GPIO.LOW:
+        count += 1
+        if count > timeout:
+            return None, None  # Timeout waiting for LOW
+
+    count = 0
+    while wiringpi.digitalRead(dht_pin) == GPIO.HIGH:
+        count += 1
+        if count > timeout:
+            return None, None  # Timeout waiting for HIGH
+
+    # Read 40 bits (5 bytes)
+    data = [0] * 5
+    for i in range(40):
+        count = 0
+        while wiringpi.digitalRead(dht_pin) == GPIO.LOW:
+            count += 1
+            if count > timeout:
+                return None, None  # Timeout waiting for LOW
+
+        count = 0
+        while wiringpi.digitalRead(dht_pin) == GPIO.HIGH:
+            count += 1
+            if count > timeout:
+                return None, None  # Timeout waiting for HIGH
+
+        # If HIGH duration > 50s, it's a 1; otherwise, it's a 0
+        bit = 1 if count > 50 else 0
+        data[i // 8] |= bit << (7 - (i % 8))
+
+    # Verify checksum
+    if data[4] != (data[0] + data[1] + data[2] + data[3]) & 0xFF:
+        return None, None  # Checksum failed
+
+    humidity = data[0]  # Integer part of humidity
+    temperature = data[2]  # Integer part of temperature
+    return humidity, temperature
+
+print("Reading DHT11 on WiringPi pin 2 (physical pin 7/PC9)...")
+
+try:
+    while True:
+        humidity, temperature = read_dht11()
+        retries = 0
+        max_retries = 10  # Try up to 10 times
+        # Keep trying until a valid, non-zero reading is obtained or max retries reached
+        while (humidity is None or temperature is None or humidity == 0 or temperature == 0) and retries < max_retries:
+            time.sleep(0.5)  # Wait 0.5 seconds before retrying
+            humidity, temperature = read_dht11()
+            retries += 1
+        # Only process if the reading is valid
+        if humidity is not None and temperature is not None and humidity != 0 and temperature != 0:
+            print(f"Temp: {temperature}C, Humidite: {humidity}%")
+            # Prepare data for the backend
+            data = {
+                "temperature": temperature,
+                "humidity": humidity,
+                "timestamp": datetime.now().isoformat(),
+                "patientId": "15"  # Include the patient ID
+            }
+            # Send data to backend
+            try:
+                response = requests.post(API_URL, json=data)
+                if response.status_code == 200:
+                    print(f"Data sent successfully: {data}")
+                else:
+                    print(f"Failed to send data: {response.status_code} - {response.text}")
+            except Exception as e:
+                print(f"Error sending data: {e}")
+        time.sleep(0.5)  # Wait 60 seconds before the next reading
+except KeyboardInterrupt:
+    print("\nExiting program.")
